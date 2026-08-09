@@ -274,9 +274,12 @@ const fmtBytes = n => n < 1024 ? n + ' B'
 
 const plural = (n, s = 's') => n > 1 ? s : '';
 
+/* Never DD/MM or MM/DD here: this label sits right next to a native date
+   input, and the two conventions read as different days. A spelled-out month
+   cannot be misread. */
 function prettyKey(key) {
   const p = String(key || '').split('-');
-  if (p.length === 3) return `${p[2]}/${p[1]}/${p[0]}`;
+  if (p.length === 3) return `${+p[2]} ${(MONTHS[+p[1] - 1] || '').slice(0, 3)} ${p[0]}`;
   if (p.length === 2) return `${MONTHS[+p[1] - 1] || p[1]} ${p[0]}`;
   return key;
 }
@@ -376,7 +379,7 @@ async function upload(files) {
 
   const fd = new FormData();
   pdfs.forEach(f => fd.append('files', f));
-  fd.append('locale', 'fr');
+  fd.append('locale', 'fr');   // date convention fallback, see buildBody()
 
   try {
     const data = await api('/api/lots', { method: 'POST', body: fd });
@@ -404,7 +407,7 @@ async function addFiles(files) {
   if (!pdfs.length || !S.sid) return;
   const fd = new FormData();
   pdfs.forEach(f => fd.append('files', f));
-  fd.append('locale', 'fr');
+  fd.append('locale', 'fr');   // date convention fallback, see buildBody()
   try {
     pushBusy('analyzing…');
     const data = await api(`/api/lots/${S.sid}/documents`, { method: 'POST', body: fd });
@@ -1137,6 +1140,9 @@ function buildBody() {
     finders: activeFinders(),
     date_rule: buildDateRule(),
     per_doc: perDocTweaks(),
+    // Fallback day/month convention for dates the document itself does not
+    // disambiguate — not the interface language. The engine prefers the
+    // evidence it finds in the document.
     locale: 'fr',
     auto_repair: $('#optRepair').checked,
     verify: true,
