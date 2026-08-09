@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Atelier PDF — replace text without touching anything else</title>
+<meta name="description" content="Replace any text in a PDF while keeping the original font, metrics and layout, with pixel-level verification.">
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230a0b0e'/><path d='M8 22V10h6a4 4 0 010 8H8' stroke='%23c9f24d' stroke-width='2.5' fill='none' stroke-linecap='square'/><circle cx='23' cy='21' r='2.5' fill='%23c9f24d'/></svg>">
+</head>
+<body>
+
+<!-- ================= LANDING SCREEN ================= -->
+<div id="landing" class="landing">
+  <div class="landing-inner">
+    <div class="brand">
+      <span class="brand-mark">◐</span>
+      <span class="brand-name">Atelier<em>PDF</em></span>
+    </div>
+
+    <h1 class="hero">
+      Replace the text.<br>
+      <span class="hero-dim">Move nothing else.</span>
+    </h1>
+
+    <p class="lede">
+      Drop one or more PDFs. The same rules apply to all of them.
+    </p>
+
+    <label class="drop" id="drop" tabindex="0">
+      <input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
+      <div class="drop-icon">↧</div>
+      <div class="drop-title">Drop your PDFs</div>
+      <div class="drop-sub">40 MB per file · 24 files</div>
+    </label>
+
+    <div class="landing-status" id="landingStatus" hidden>
+      <div class="spinner"></div>
+      <span id="landingStatusText">Analyzing…</span>
+    </div>
+  </div>
+</div>
+
+<!-- ================= WORKSPACE ================= -->
+<div id="workspace" class="workspace" hidden>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="icon-btn" id="btnBack" title="Start over">←</button>
+      <span class="brand-mark small">◐</span>
+      <div class="doc-id">
+        <span class="doc-name" id="docName">document.pdf</span>
+        <span class="doc-meta" id="docMeta"></span>
+      </div>
+    </div>
+
+    <nav class="viewtabs" id="viewTabs">
+      <button data-view="before" class="on">Before</button>
+      <button data-view="after" disabled>After</button>
+      <button data-view="compare" disabled>Compare</button>
+      <button data-view="diff" disabled>Verify</button>
+    </nav>
+
+    <div class="topbar-right">
+      <div class="pager">
+        <button class="icon-btn" id="pgPrev" title="previous page">‹</button>
+        <button class="pg-label mono" id="pgLabel" title="go to a page">1/1</button>
+        <input class="pg-input mono" id="pgInput" type="number" min="1" hidden>
+        <button class="icon-btn" id="pgNext" title="next page">›</button>
+      </div>
+      <button class="btn btn-ghost" id="btnDownloadOne" disabled
+              title="this document only">This PDF</button>
+      <button class="btn btn-ghost" id="btnDownload" disabled>Download all</button>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <!-- ---------- document rail ---------- -->
+    <nav class="rail" id="rail">
+      <div class="rail-head">
+        <span>Documents</span>
+        <span class="count mono" id="railCount">0</span>
+      </div>
+      <div class="rail-list" id="railList"></div>
+      <label class="rail-add" id="railAdd">
+        <input type="file" id="fileMore" accept="application/pdf,.pdf" multiple hidden>
+        + add
+      </label>
+    </nav>
+
+    <!-- ---------- stage ---------- -->
+    <section class="stage" id="stage">
+      <div class="stage-scroll" id="stageScroll">
+        <div class="pages" id="pages"></div>
+      </div>
+      <div class="wipe-knob" id="wipeKnob" hidden>
+        <span></span>
+        <em class="wipe-tag wipe-tag-l">before</em>
+        <em class="wipe-tag wipe-tag-r">after</em>
+      </div>
+      <div class="page-hud" id="pageHud" hidden></div>
+      <div class="stage-legend" id="stageLegend"></div>
+    </section>
+
+    <!-- ---------- panel ---------- -->
+    <aside class="panel">
+
+      <div class="card" id="warnCard" hidden>
+        <div class="card-head"><h2>Heads-up</h2></div>
+        <ul class="warn-list" id="warnList"></ul>
+      </div>
+
+      <!-- ----- rules ----- -->
+      <div class="card">
+        <div class="card-head">
+          <h2>Rules</h2>
+          <span class="busy" id="busy" hidden>
+            <span class="spinner"></span>
+            <span id="busyText">searching…</span>
+          </span>
+        </div>
+
+        <p class="hint">What to look for, what should replace it.
+        As many rules as you need.</p>
+
+        <div class="rule-list" id="ruleList"></div>
+
+        <button class="add-rule" id="btnAddRule">+ add a rule</button>
+
+        <label class="check">
+          <input type="checkbox" id="optRepair" checked>
+          <span>Repair incomplete fonts automatically</span>
+        </label>
+      </div>
+
+      <!-- ----- dates ----- -->
+      <div class="card">
+        <div class="card-head">
+          <h2>Dates</h2>
+          <span class="pill mono" id="convPill" hidden></span>
+        </div>
+
+        <label class="check check-lead">
+          <input type="checkbox" id="optDates">
+          <span>Also detect dates, whatever their written format</span>
+        </label>
+
+        <div class="dates-body" id="datesBody" hidden>
+          <div class="seg" id="modeSeg">
+            <button data-mode="map" class="on">Mapping</button>
+            <button data-mode="shift">Shift</button>
+            <button data-mode="manual">Manual</button>
+          </div>
+
+          <!-- mapping mode -->
+          <div class="mode-body" data-body="map">
+            <p class="hint">Every distinct date in the document. Leave blank to
+            keep it as is.</p>
+            <div id="mapList" class="map-list"></div>
+          </div>
+
+          <!-- shift mode -->
+          <div class="mode-body" data-body="shift" hidden>
+            <p class="hint">Shift every selected date by the same amount.</p>
+            <div class="steppers">
+              <label class="stepper"><span>Days</span>
+                <input type="number" id="shDays" value="0" step="1"></label>
+              <label class="stepper"><span>Months</span>
+                <input type="number" id="shMonths" value="0" step="1"></label>
+              <label class="stepper"><span>Years</span>
+                <input type="number" id="shYears" value="1" step="1"></label>
+            </div>
+            <div class="presets" id="shiftPresets">
+              <button data-d="0" data-m="0" data-y="1">+1 year</button>
+              <button data-d="0" data-m="0" data-y="-1">−1 year</button>
+              <button data-d="0" data-m="1" data-y="0">+1 month</button>
+              <button data-d="0" data-m="-1" data-y="0">−1 month</button>
+              <button data-d="1" data-m="0" data-y="0">+1 day</button>
+            </div>
+          </div>
+
+          <!-- manual mode -->
+          <div class="mode-body" data-body="manual" hidden>
+            <p class="hint">No automatic rule: type the value you want in the
+            free field of each match below. The text is written as is, with no
+            reformatting.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ----- matches ----- -->
+      <div class="card" id="memCard" hidden>
+        <div class="card-head">
+          <h2>Saved rules</h2>
+          <button class="link" id="memClear">forget all</button>
+        </div>
+        <p class="hint">The rules you have applied, kept in this browser only.
+        Click one to add it to the list or take it out.</p>
+        <div class="mem-list" id="memList"></div>
+      </div>
+
+      <div class="card" id="fontCard" hidden>
+        <div class="card-head"><h2>Source font</h2></div>
+        <p class="hint" id="fontHint"></p>
+        <label class="font-drop" id="fontDrop">
+          <input type="file" id="fontFile" accept=".ttf,.otf,.ttc" hidden>
+          <span>Upload the font file (.ttf, .otf)</span>
+        </label>
+        <div id="fontList" class="font-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Matches</h2>
+          <span class="count mono" id="occCount">0</span>
+        </div>
+        <div class="occ-tools">
+          <button class="link" id="selAll">check all</button>
+          <button class="link" id="selNone">uncheck all</button>
+          <input type="search" id="occFilter" placeholder="filter…">
+        </div>
+        <div class="occ-list" id="occList"></div>
+      </div>
+
+      <div class="card" id="reportCard" hidden>
+        <div class="card-head"><h2>Report</h2></div>
+        <div id="reportBody"></div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="actionbar">
+    <div class="action-summary" id="actionSummary"></div>
+    <div class="action-btns">
+      <button class="btn btn-ghost" id="btnReset">Reset</button>
+      <button class="btn btn-primary" id="btnApply">Apply</button>
+    </div>
+  </footer>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

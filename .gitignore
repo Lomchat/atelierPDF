@@ -1,0 +1,17 @@
+# Uploaded documents, renders and session state. Never tracked: these are
+# other people's files.
+data/
+
+# Local environment
+venv/
+__pycache__/
+*.py[cod]
+.env
+
+# Agent notes, kept out of the public repo
+CLAUDE.md
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
