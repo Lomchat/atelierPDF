@@ -3,7 +3,7 @@
 data/
 
 # Local environment
-venv/
+.venv/
 __pycache__/
 *.py[cod]
 .env
