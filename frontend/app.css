@@ -779,3 +779,6 @@ h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.02em; }
   .viewtabs button { padding: 5px 10px; font-size: 12px; }
   .doc-name { max-width: 16ch; }
 }
+
+.api-link { margin: 20px 0 0; }
+.api-link a { display: inline-flex; align-items: center; text-decoration: none; }

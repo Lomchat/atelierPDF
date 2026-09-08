@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connexion administrateur — Atelier PDF</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+body{overflow:auto;min-height:100%;display:grid;place-items:center}.login{width:min(100%,460px);padding:40px 24px}.login-card{margin-top:30px;padding:28px;background:var(--surface);border:1px solid var(--line);border-radius:14px}h1{font-size:26px;line-height:1.2}.intro{color:var(--dim);margin:12px 0 26px}.login-form{display:grid;gap:20px}.login-form label{display:grid;gap:8px;font-size:14px}.login-form input{width:100%;min-width:0;padding:12px;background:var(--ink);border:1px solid var(--line);border-radius:7px;font:inherit;color:var(--text)}.login-form input:focus{outline:2px solid var(--acid);outline-offset:2px}.login-form .btn{justify-content:center;min-height:44px;margin-top:4px}.login-error{color:var(--red);background:var(--ink);border:1px solid var(--red);border-radius:7px;padding:12px;font-size:14px;margin:0 0 22px}.back{display:inline-block;color:var(--dim);margin-top:24px;font-size:14px}.back:hover{color:var(--acid)}@media(max-width:420px){.login{padding:28px 18px}.login-card{padding:24px 20px}}
+</style>
+</head>
+<body>
+<main class="login">
+<div class="brand"><span class="brand-mark">◐</span><span class="brand-name">Atelier<em>PDF</em></span></div>
+<section class="login-card" aria-labelledby="login-title">
+<h1 id="login-title">Administration</h1>
+<p class="intro">Connectez-vous pour consulter le journal des opérations.</p>
+<!-- LOGIN_ERROR -->
+<form class="login-form" method="post" action="/admin/login">
+<label for="user">Utilisateur<input id="user" name="user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="256" required autofocus></label>
+<label for="secret">Mot de passe<input id="secret" name="secret" type="password" autocomplete="current-password" maxlength="1024" required></label>
+<button class="btn btn-primary" type="submit">Se connecter</button>
+</form>
+</section>
+<a class="back" href="/">← Retour à la plateforme</a>
+</main>
+</body>
+</html>

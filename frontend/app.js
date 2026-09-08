@@ -101,9 +101,8 @@ const MONTHS = ['January','February','March','April','May','June','July',
 const FIT_LABELS = { auto: 'auto', exact: 'exact', fit: 'fitted', push: 'pushed' };
 
 /* ================================================================ saved rules
-   Applied rules are kept in this browser and nowhere else: they contain the
-   text of the user's documents, which has no business on a server. Hence the
-   "forget all" button too.
+   Saved-rule shortcuts are kept in this browser. The server also records
+   submitted rules in the administrator operation log.
    ================================================================ */
 
 const MEM_KEY = 'atelierpdf.rules.v1';
@@ -253,7 +252,9 @@ function debounce(fn, ms) {
 }
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, opts);
+  const headers = new Headers(opts.headers);
+  headers.set('X-Atelier-Source', 'plateforme');
+  const r = await fetch(path, { ...opts, headers });
   if (!r.ok) {
     let msg = r.statusText;
     try { const j = await r.json(); msg = j.detail || msg; } catch (_) {}
@@ -1766,7 +1767,7 @@ function initOccList() {
 
 function initWorkspace() {
   $('#btnBack').addEventListener('click', () => {
-    if (S.sid) fetch(`/api/lots/${S.sid}`, { method: 'DELETE' }).catch(() => {});
+    if (S.sid) fetch(`/api/lots/${S.sid}`, { method: 'DELETE', headers: { 'X-Atelier-Source': 'plateforme' } }).catch(() => {});
     scanToken++; simToken++;
     S.sid = null; S.analysis = null;
     resetSession();

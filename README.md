@@ -140,6 +140,9 @@ git clone https://github.com/Lomchat/atelierPDF.git
 cd atelierPDF
 python3 -m venv venv
 ./venv/bin/pip install -r backend/requirements.txt
+cp .env.example .env
+# Set ADMIN_USERNAME and ADMIN_PASSWORD in .env before starting.
+chmod 600 .env
 cd backend && ../venv/bin/uvicorn main:app --port 10560
 ```
 
@@ -161,7 +164,68 @@ sudo systemctl enable --now pdf
 
 ---
 
-## API
+## Public API and administration
+
+Interactive Swagger documentation: **https://pdf.chalco.website/api/docs**,
+also linked from the home page. No API key is required.
+
+`POST /api/replace` takes one or more `files` and a JSON array of `equivalences`
+in a multipart form. All equivalences apply to each original document; rules
+are not chained. Text, regex and date rules use the same engine as the platform.
+
+```bash
+curl --fail-with-body https://pdf.chalco.website/api/replace \
+  -F 'files=@invoice.pdf;type=application/pdf' \
+  -F 'equivalences=[{"query":"2024","replace":"2025"},{"query":"Jean Dupont","replace":"Marc Dubois"}]' \
+  -o invoice-modified.pdf
+```
+
+Repeat `-F 'files=@another.pdf;type=application/pdf'` for multiple files and save
+the response as `.zip`. The archive includes all resulting PDFs and `report.json`.
+A single input returns a PDF. Files with no matches are returned unchanged.
+`X-Replacements-Applied` reports the replacement count; `X-Operation-Id` links
+the response to the admin log. Outputs use an `_1` suffix and duplicate names
+are disambiguated.
+
+Optional form fields: `locale=fr|en`, `auto_repair=true`, `verify=true`, and
+`date_rule` as JSON. For example, use `equivalences=[{"kind":"dates"}]` with
+`date_rule={"type":"shift","years":1}` or
+`date_rule={"type":"map","pairs":{"2024-03-15":"2025-03-15"}}`.
+
+Limits: 24 files, 40 MiB per file, 160 MiB total, 800 pages per document,
+24 equivalences, 4000 matches per document and 240 seconds of processing.
+Invalid files, refused replacements or failed visual verification return a JSON
+error for the whole request (400/413/422/504), with no partial download.
+The API uses a temporary process and directory, both released before returning
+the result; it creates no persistent PDF session.
+
+**Administration:** https://pdf.chalco.website/admin uses a normal login form
+over HTTPS and a secure HttpOnly session cookie, valid for eight hours. The
+logout button revokes the session on the server. Sessions are shared by both
+workers and survive restarts; changing the credentials invalidates them. Configure `ADMIN_USERNAME` and `ADMIN_PASSWORD` in the root `.env`
+(ignored by Git, mode 600); restart the service after changing them. An example
+without production credentials is provided in `.env.example`.
+
+The paginated, searchable log records platform and API operations: timestamp,
+client IP, origin, path, HTTP status, duration, filenames, sizes, submitted rules,
+replacement results and errors. It stores metadata only, never PDF binaries,
+page images or whole-document extracted text. Source labels are informational
+and inferred from the client, not an authentication mechanism. Existing
+`data/usage.log` entries are imported once as historical records.
+
+The SQLite database `data/operations.sqlite3` persists across service restarts
+and supports the two server workers. Both the admin page and its data endpoint
+require authentication and send `Cache-Control: no-store`. The platform's
+interactive PDFs and renders retain their existing three-hour expiration.
+
+Run the integration tests with a separate test dependency install:
+
+```bash
+.venv/bin/pip install -r backend/requirements-dev.txt
+.venv/bin/pytest backend/tests -q
+```
+
+## Session API
 
 The unit of work is a **batch**: N documents sharing the same rules.
 

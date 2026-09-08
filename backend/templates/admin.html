@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Administration — Atelier PDF</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+body{overflow:auto}.admin{max-width:1440px;margin:auto;padding:40px 24px}header{display:flex;justify-content:space-between;gap:20px;align-items:center;flex-wrap:wrap}h1{font-size:32px;margin-top:22px}a{color:var(--acid)}.intro{color:var(--dim);max-width:850px}.filters{display:flex;gap:12px;flex-wrap:wrap;margin:28px 0 18px;align-items:end}label{display:grid;gap:6px;font-size:13px;color:var(--dim)}input,select{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:10px;min-height:42px}input{min-width:280px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{background:var(--surface);color:var(--dim);font-size:12px;text-transform:uppercase;white-space:nowrap}td{max-width:450px;overflow-wrap:anywhere}.tag{border:1px solid var(--line);padding:3px 8px;border-radius:5px;white-space:nowrap}.success{color:var(--acid)}.error{color:var(--red)}details{margin-top:8px}summary{cursor:pointer;color:var(--blue)}pre{white-space:pre-wrap;font-size:12px;max-height:500px;overflow:auto;background:var(--surface);padding:14px;border-radius:8px;min-width:260px}.pager-bar{display:flex;gap:16px;justify-content:space-between;align-items:center;margin-top:20px}.muted{color:var(--dim)}#message{margin:16px 0}.btn:disabled{opacity:.4;cursor:default}.links{display:flex;gap:20px;align-items:center;flex-wrap:wrap}.links form{margin:0}@media(max-width:600px){.admin{padding:24px 14px}input{min-width:0;width:100%}.filters label:first-child{width:100%}}
+</style>
+</head>
+<body><main class="admin">
+<header><div class="brand"><span class="brand-mark">◐</span><span class="brand-name">Atelier<em>PDF</em></span></div><nav class="links"><a href="/">Plateforme</a><a href="/api/docs">Documentation API</a><form method="post" action="/admin/logout"><button class="btn btn-ghost" type="submit">Se déconnecter</button></form></nav></header>
+<h1>Journal des opérations</h1>
+<p class="intro">Activité de la plateforme et de l’API : fichiers, équivalences, résultats et erreurs. Ce journal ne contient aucun PDF. Les fichiers API sont supprimés après traitement ; les sessions de la plateforme expirent après trois heures.</p>
+<form class="filters" id="filters">
+<label>Rechercher<input type="search" id="search" placeholder="Fichier, IP, équivalence, identifiant…" maxlength="200"></label>
+<label>Origine<select id="source"><option value="">Toutes les origines</option><option value="plateforme">Plateforme</option><option value="api">API</option><option value="historique">Historique</option></select></label>
+<label>Résultat HTTP<select id="status"><option value="">Tous les résultats</option><option value="success">Succès</option><option value="error">Erreurs</option></select></label>
+<button class="btn btn-primary" type="submit">Filtrer</button><button class="btn btn-ghost" type="button" id="refresh">Actualiser</button>
+</form>
+<p id="message" role="status" aria-live="polite">Chargement…</p>
+<div class="table-wrap"><table><thead><tr><th>Date et heure</th><th>Origine / IP</th><th>Opération</th><th>Résultat</th><th>Fichiers et détails</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="pager-bar"><button class="btn btn-ghost" id="previous" disabled>← Précédent</button><span id="pagination" class="muted"></span><button class="btn btn-ghost" id="next" disabled>Suivant →</button></div>
+<p class="muted">Heures affichées dans le fuseau de votre navigateur. L’origine est déduite du client ; les anciennes traces sont regroupées dans « Historique ».</p>
+</main>
+<script>
+'use strict';
+const el=id=>document.getElementById(id);let page=1,loading=false;
+const labels={upload:'Envoi de PDF',add:'Ajout de PDF',replace:'Remplacement API',apply:'Application',scan:'Recherche',simulate:'Simulation',remove_document:'Suppression de PDF',drop_lot:'Suppression de session',page_png:'Aperçu de page',diff_png:'Vérification visuelle',download:'Téléchargement',download_one:'Téléchargement PDF',upload_font:'Envoi de police',get_lot_state:'Consultation de session'};
+function text(tag,value,cls){const node=document.createElement(tag);node.textContent=value;if(cls)node.className=cls;return node;}
+async function load(){if(loading)return;loading=true;el('message').textContent='Chargement…';el('refresh').disabled=true;
+try{const params=new URLSearchParams({page,limit:50,q:el('search').value,source:el('source').value,status:el('status').value});const response=await fetch('/api/admin/operations?'+params,{cache:'no-store'});if(response.status===401){window.location.replace('/admin/login');return;}if(!response.ok)throw new Error('Impossible de charger le journal.');const data=await response.json();el('rows').replaceChildren();
+for(const item of data.items){const row=document.createElement('tr');row.append(text('td',new Date(item.t*1000).toLocaleString('fr-FR')));const origin=document.createElement('td');origin.append(text('span',item.source,'tag'),text('div',item.ip||'—','muted'));row.append(origin);const op=document.createElement('td');op.append(text('div',labels[item.event]||item.event),text('small',[item.method,item.path].filter(Boolean).join(' '),'muted'));row.append(op);const result=document.createElement('td');result.append(text('span',String(item.status),item.status>=400?'error':'success'));if(item.applied!==undefined)result.append(text('div',item.applied+' remplacement(s)'));if(item.duration_ms!==undefined)result.append(text('small',item.duration_ms+' ms','muted'));row.append(result);const info=document.createElement('td');const names=item.names||(item.files||item.documents||[]).map(d=>d.filename).filter(Boolean);info.append(text('div',names.join(', ')||item.sid||'—'));const details=document.createElement('details');details.append(text('summary','Voir tous les détails'),text('pre',JSON.stringify(item,null,2)));info.append(details);row.append(info);el('rows').append(row);}
+const pages=Math.max(1,Math.ceil(data.total/data.limit));el('message').textContent=data.total?data.total+' opération(s) — les plus récentes en premier.':'Aucune opération pour ces filtres.';el('pagination').textContent='Page '+page+' / '+pages;el('previous').disabled=page<=1;el('next').disabled=page>=pages;
+}catch(error){el('message').textContent=error.message;}finally{loading=false;el('refresh').disabled=false;}}
+el('filters').addEventListener('submit',event=>{event.preventDefault();if(!loading){page=1;load();}});el('refresh').onclick=()=>load();el('previous').onclick=()=>{if(!loading){page--;load();}};el('next').onclick=()=>{if(!loading){page++;load();}};load();
+</script></body></html>

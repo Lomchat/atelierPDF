@@ -8,7 +8,7 @@ User=root
 WorkingDirectory=/srv/pdf/backend
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/srv/pdf/venv/bin/uvicorn main:app \
+ExecStart=/srv/pdf/.venv/bin/uvicorn main:app \
     --host 127.0.0.1 --port 10560 \
     --workers 2 \
     --timeout-keep-alive 30 \

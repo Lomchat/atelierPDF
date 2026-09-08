@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 import uuid
 import zipfile
@@ -26,6 +27,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import fitz
+from dotenv import load_dotenv
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from audit import AuditStore, install_admin, install_audit
+from public_api import install_public_api
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
@@ -39,7 +46,8 @@ from engine.search import Finder as EngineFinder
 from engine.verify import diff_image
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+DATA_DIR = os.environ.get("ATELIER_DATA_DIR", os.path.join(BASE_DIR, "data"))
 LOTS_DIR = os.path.join(DATA_DIR, "sessions")
 FONTS_DIR = os.path.join(DATA_DIR, "fonts")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
@@ -59,7 +67,11 @@ MAX_PARALLEL = 4
 for d in (DATA_DIR, LOTS_DIR, FONTS_DIR):
     os.makedirs(d, exist_ok=True)
 
-app = FastAPI(title="Atelier PDF", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Atelier PDF", version="1.1.0",
+              description="API publique de remplacement de texte dans les PDF. Commencez par POST /api/replace.",
+              openapi_tags=[{"name": "API publique"}, {"name": "default", "description": "Parcours interactif par sessions utilisé par la plateforme."}],
+              docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None,
+              swagger_ui_parameters={"defaultModelsExpandDepth": -1, "displayRequestDuration": True})
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 _font_library = FontLibrary(extra_dirs=[FONTS_DIR])
@@ -241,22 +253,28 @@ def _output_name(filename: str) -> str:
 
 
 def _log(request: Request, event: str, **fields) -> None:
-    """
-    Minimal usage log.
+    """Add metadata to the single audit record for this request."""
+    if hasattr(request.state, "audit"):
+        request.state.audit.update(event=event, **fields)
 
-    A service that rewrites text inside documents can be used to forge. Keeping
-    a timestamped trace prevents nothing, but makes it possible to answer if
-    the question ever comes up.
-    """
-    try:
-        ip = request.headers.get("x-forwarded-for", "") or \
-            (request.client.host if request.client else "")
-        rec = {"t": round(time.time()), "ip": ip.split(",")[0].strip(), "event": event}
-        rec.update(fields)
-        with open(LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+
+_audit_store = AuditStore(os.path.join(DATA_DIR, "operations.sqlite3"), LOG_PATH)
+install_audit(app, _audit_store)
+install_admin(app, _audit_store)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def logged_http_error(request: Request, exc):
+    if hasattr(request.state, "audit"):
+        request.state.audit["error"] = exc.detail
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def logged_validation_error(request: Request, exc):
+    if hasattr(request.state, "audit"):
+        request.state.audit["error"] = [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+    return await request_validation_exception_handler(request, exc)
 
 
 async def _cleanup_loop() -> None:
@@ -401,7 +419,7 @@ async def _ingest(lot: Lot, files: List[UploadFile], locale: str) -> List[Doc]:
     for up in files:
         if len(lot.docs) >= MAX_DOCS:
             raise HTTPException(413, "Maximum %d documents per batch." % MAX_DOCS)
-        raw = await up.read()
+        raw = await up.read(MAX_FILE_BYTES + 1)
         name = _safe_name(up.filename)
         if not raw:
             continue
@@ -441,6 +459,7 @@ async def _ingest(lot: Lot, files: List[UploadFile], locale: str) -> List[Doc]:
 @app.post("/api/lots")
 async def create_lot(request: Request, files: List[UploadFile] = File(...),
                      locale: str = Form("fr")) -> JSONResponse:
+    _log(request, "upload", names=[_safe_name(f.filename) for f in files])
     if not files:
         raise HTTPException(400, "No file.")
     sid = uuid.uuid4().hex[:20]
@@ -457,7 +476,7 @@ async def create_lot(request: Request, files: List[UploadFile] = File(...),
 
     LOTS[sid] = lot
     _log(request, "upload", sid=sid, docs=len(lot.docs), bytes=lot.total_bytes,
-         names=[d.filename for d in lot.docs])
+         names=[d.filename for d in lot.docs], files=[{"filename": d.filename, "size": d.size, "pages": d.pages, "error": d.error} for d in lot.docs])
     return JSONResponse(lot.to_dict())
 
 
@@ -466,17 +485,19 @@ async def add_documents(request: Request, sid: str,
                         files: List[UploadFile] = File(...),
                         locale: str = Form("fr")) -> JSONResponse:
     lot = get_lot(sid)
+    _log(request, "add", sid=sid, names=[_safe_name(f.filename) for f in files])
     added = await _ingest(lot, files, locale)
-    _log(request, "add", sid=sid, docs=len(added))
+    _log(request, "add", sid=sid, docs=len(added), files=[{"filename": d.filename, "size": d.size, "pages": d.pages, "error": d.error} for d in added])
     return JSONResponse({"id": sid, "added": [d.did for d in added],
                          "docs": [d.to_dict() for d in lot.docs]})
 
 
 @app.delete("/api/lots/{sid}/documents/{did}")
-async def remove_document(sid: str, did: str) -> dict:
+async def remove_document(request: Request, sid: str, did: str) -> dict:
     lot = get_lot(sid)
     check_did(did)
-    lot.doc(did)
+    doc = lot.doc(did)
+    _log(request, "remove_document", sid=sid, names=[doc.filename])
     drop_cached(lot.cache_key(did))
     shutil.rmtree(lot.doc_dir(did), ignore_errors=True)
     lot.docs = [d for d in lot.docs if d.did != did]
@@ -496,8 +517,9 @@ async def drop_lot(sid: str) -> dict:
 
 
 @app.post("/api/lots/{sid}/scan")
-async def scan(sid: str, req: EditRequest) -> JSONResponse:
+async def scan(request: Request, sid: str, req: EditRequest) -> JSONResponse:
     """Applies the search rules to the whole batch."""
+    request.state.audit["rules"] = req.model_dump()
     lot = get_lot(sid)
     finders = req.engine_finders()
     rule = req.date_rule.dict(exclude_none=False)
@@ -510,6 +532,7 @@ async def scan(sid: str, req: EditRequest) -> JSONResponse:
         return {"id": doc.did, "analysis": doc.analysis}
 
     out = await _for_each_doc(lot, req, one)
+    request.state.audit["documents"] = [{"id": d["id"], "error": d.get("error"), "matches": len((d.get("analysis") or {}).get("occurrences", [])), "finder_errors": (d.get("analysis") or {}).get("finder_errors", {})} for d in out]
     lot.save()
     return JSONResponse({"id": sid, "docs": out})
 
@@ -529,7 +552,8 @@ def _process_args(lot: Lot, doc: Doc, req: EditRequest, dry: bool) -> dict:
 
 
 @app.post("/api/lots/{sid}/simulate")
-async def simulate(sid: str, req: EditRequest) -> JSONResponse:
+async def simulate(request: Request, sid: str, req: EditRequest) -> JSONResponse:
+    request.state.audit["rules"] = req.model_dump()
     lot = get_lot(sid)
 
     async def one(doc: Doc) -> dict:
@@ -537,11 +561,14 @@ async def simulate(sid: str, req: EditRequest) -> JSONResponse:
         outcome = await _run(process, raw, **_process_args(lot, doc, req, True))
         return {"id": doc.did, "outcome": outcome.to_dict()}
 
-    return JSONResponse({"id": sid, "docs": await _for_each_doc(lot, req, one)})
+    out = await _for_each_doc(lot, req, one)
+    request.state.audit["documents"] = out
+    return JSONResponse({"id": sid, "docs": out})
 
 
 @app.post("/api/lots/{sid}/apply")
 async def apply_lot(request: Request, sid: str, req: EditRequest) -> JSONResponse:
+    request.state.audit["rules"] = req.model_dump()
     lot = get_lot(sid)
 
     async def one(doc: Doc) -> dict:
@@ -573,6 +600,7 @@ async def apply_lot(request: Request, sid: str, req: EditRequest) -> JSONRespons
     lot.save()
 
     applied = sum((d.get("outcome") or {}).get("applied", 0) for d in out)
+    request.state.audit["documents"] = out
     _log(request, "apply", sid=sid, docs=len(out), applied=applied,
          modified=sum(1 for d in lot.docs if d.has_output))
     return JSONResponse({"id": sid, "docs": out,
@@ -642,12 +670,13 @@ async def diff_png(sid: str, did: str, page: int, dpi: int = 130) -> Response:
 
 
 @app.get("/api/lots/{sid}/documents/{did}/download")
-async def download_one(sid: str, did: str) -> FileResponse:
+async def download_one(request: Request, sid: str, did: str) -> FileResponse:
     lot = get_lot(sid)
     check_did(did)
     doc = lot.doc(did)
     if not doc.has_output:
         raise HTTPException(409, "This document was not modified.")
+    _log(request, "download_one", sid=sid, names=[doc.filename], docs=1)
     return FileResponse(lot.edited(did), media_type="application/pdf",
                         filename=_output_name(doc.filename))
 
@@ -691,7 +720,7 @@ async def download_all(request: Request, sid: str) -> Response:
 
 
 @app.post("/api/lots/{sid}/fonts")
-async def upload_font(sid: str, file: UploadFile = File(...),
+async def upload_font(request: Request, sid: str, file: UploadFile = File(...),
                       target: str = Form("")) -> dict:
     """
     Manual upload of a source font, when the server does not have it.
@@ -725,12 +754,15 @@ async def upload_font(sid: str, file: UploadFile = File(...),
         if k:
             lot.extra_fonts[k] = path
     lot.save()
+    _log(request, "upload_font", sid=sid, names=[_safe_name(file.filename)], target=target, font_names=names, bytes=len(raw))
     return {"ok": True, "names": names}
 
 
 # --------------------------------------------------------------------------
 # Static frontend
 # --------------------------------------------------------------------------
+
+install_public_api(app, sys.modules[__name__])
 
 if os.path.isdir(FRONTEND_DIR):
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
