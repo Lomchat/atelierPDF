@@ -189,7 +189,7 @@ def _decide_fit(delta_pt: float, scale: Optional[float], gap_after: Optional[flo
             return PUSH, "nothing follows on the line"
         if scale is not None and scale >= _SCALE_FLOOR:
             return FIT, "would run past the margin: condensed to %.0f %%" % (scale * 100)
-        return PUSH, "runs past the margin by %.0f pt" % (delta_pt - room)
+        return FIT, "page boundary requires fit (%.0f %%)" % ((scale or 1) * 100)
 
     isolated = em > 0 and gap_after >= _GAP_EM_THRESHOLD * em
 
@@ -212,8 +212,7 @@ def _decide_fit(delta_pt: float, scale: Optional[float], gap_after: Optional[flo
         return PUSH, "running text: the line grows by %.0f pt, the margin allows it" % delta_pt
     if scale is not None and scale >= _SCALE_FLOOR:
         return FIT, "would run past the margin: condensed to %.0f %%" % (scale * 100)
-    return PUSH, "runs past the margin by %.0f pt — condensing would make it illegible" % (
-        delta_pt - (room or 0))
+    return FIT, "page boundary requires fit (%.0f %%)" % ((scale or 1) * 100)
 
 
 # --------------------------------------------------------------------------
@@ -511,7 +510,16 @@ def _plan_groups(unit: ContentUnit, groups: List[List[_Span]], new_text: str,
     Pairs each source group with a piece of the replacement, decides the
     strategy and the width handling. Modifies nothing.
     """
-    if len(groups) == 1:
+    if "\n" in new_text and len(groups) > 1:
+        # A layout newline is not a font glyph or a kerning-based word gap.
+        # Preserve the existing baselines. When the target has extra lines,
+        # retain their content on the final baseline, separated by a comma.
+        words = new_text.splitlines()
+        if len(words) > len(groups):
+            words = words[:len(groups)-1] + [", ".join(words[len(groups)-1:])]
+        if len(words) != len(groups):
+            return None
+    elif len(groups) == 1:
         words = [new_text]
     else:
         words = new_text.split(" ")

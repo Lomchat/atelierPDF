@@ -436,3 +436,30 @@ def verify_documents(before_bytes: bytes, after_bytes: bytes,
         before.close()
         after.close()
     return report
+
+
+def new_outside_page(before_bytes: bytes, after_bytes: bytes) -> int:
+    """Count newly clipped visible glyphs, including those hidden by the crop.
+
+    Pixel masks cannot detect text drawn outside the page. Compare glyph
+    traces independently, ignoring clipping already present in the source.
+    """
+    from collections import Counter
+
+    def clipped(raw):
+        counts = Counter()
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            for pno, page in enumerate(doc):
+                bounds = page.rect * page.derotation_matrix
+                for span in page.get_texttrace():
+                    if span.get("type") == 3 or span.get("opacity", 1) == 0:
+                        continue
+                    for cp, gid, origin, box in span["chars"]:
+                        if cp <= 32 or gid <= 0:
+                            continue
+                        if (box[0] < bounds.x0 - .5 or box[1] < bounds.y0 - .5
+                                or box[2] > bounds.x1 + .5 or box[3] > bounds.y1 + .5):
+                            counts[(pno, cp, span.get("font", ""))] += 1
+        return counts
+
+    return sum((clipped(after_bytes) - clipped(before_bytes)).values())

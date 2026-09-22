@@ -442,6 +442,29 @@ class ContentWalker:
             tmode=ts.tmode, trise=ts.trise, ctm=ctm, tm=tm,
             codes=[c for c, _ in decoded], texts=[t for _, t in decoded],
         )
+        # Positioned glyphs (notably Stripe) may have a Tm/BT per letter.
+        # Join only geometrically adjacent glyphs on the same baseline;
+        # preserve actual line and column boundaries and character references.
+        if unit.ops and unit.text.endswith("\n") and unit.char_refs[-1] is None:
+            previous = unit.ops[-1]
+            pm = mat_mul(previous.tm, previous.ctm)
+            nm = mat_mul(sop.tm, sop.ctm)
+            a, b = pm[0], pm[1]
+            length = (a * a + b * b) ** 0.5
+            if length > 1e-8:
+                end = mat_apply(pm, previous.total_advance(), 0)
+                start = mat_apply(nm, 0, 0)
+                dx, dy = start[0] - end[0], start[1] - end[1]
+                along = (dx * a + dy * b) / length
+                across = abs(dx * b - dy * a) / length
+                em = abs(previous.fsize) * length
+                same_direction = abs(pm[0] - nm[0]) + abs(pm[1] - nm[1]) < 1e-5
+                if same_direction and across < max(0.1, em * 0.04) and -em * .15 <= along <= em * .7:
+                    unit.text = unit.text[:-1]
+                    unit.char_refs.pop()
+                    if along > em * .18 and unit.text and not unit.text[-1].isspace() and not sop.text[:1].isspace():
+                        self._append_gap(unit)
+
         op_index = len(unit.ops)
         unit.ops.append(sop)
         ts.font.used_codes.update(sop.codes)

@@ -36,7 +36,7 @@ from .surgery import (ALIGNE, AUTO, EXACT, FIT, MOTS, PUSH, REFUS, REGROUPE,
                       Replacement, ReplacementResult, apply_replacements,
                       plan_replacement)
 from .textmap import ContentUnit, build_units
-from .verify import collect_boxes, new_notdef, search_rects, verify_documents
+from .verify import collect_boxes, new_notdef, search_rects, verify_documents, new_outside_page
 
 CONTEXT_RADIUS = 46
 MAX_MATCHES = 4000
@@ -768,6 +768,7 @@ def process(pdf_bytes: bytes, finders: Sequence[Finder],
         pass
 
     by_unit: Dict[str, List[Replacement]] = {}
+    chosen_anchors: Dict[str, str] = {}
     hit_by_id: Dict[str, _Hit] = {h.ident: h for h in hits}
 
     for h in hits:
@@ -784,11 +785,25 @@ def process(pdf_bytes: bytes, finders: Sequence[Finder],
             _g, room = geoms[h.unit.page_number].measure(bbox)
             try:
                 gap = gap_to_next_glyph(h.unit, h.end, fdoc[h.unit.page_number], bbox)
+                # A different content run/column can be the next obstacle.
+                if _g is not None:
+                    gap = _g if gap is None else min(gap, _g)
             except Exception:
                 gap = _g
+        auto_anchor = "left"
+        auto_fit = AUTO
+        if bbox and gap is None and h.unit.page_number in geoms:
+            geom = geoms[h.unit.page_number]
+            # Right-aligned labels at the page edge must expand to the left.
+            # Only use this when the available line to the left is empty.
+            cy = (bbox[1] + bbox[3]) / 2
+            preceding = [w for w in geom.words if w[1] < cy < w[3] and w[2] < bbox[0] - 1]
+            if not preceding and bbox[0] > geom.page_width * .65 and abs(bbox[2] - geom.right_limit) < 6:
+                auto_anchor, auto_fit = "right", EXACT
+        chosen_anchors[h.ident] = anchors.get(h.ident, auto_anchor)
         by_unit.setdefault(h.unit.unit_id, []).append(Replacement(
             unit_id=h.unit.unit_id, start=h.start, end=h.end, new_text=target,
-            anchor=anchors.get(h.ident, "left"), fit=fits.get(h.ident, AUTO),
+            anchor=anchors.get(h.ident, auto_anchor), fit=fits.get(h.ident, auto_fit),
             ident=h.ident, gap_after=gap, room=room))
 
     unit_by_id = {u.unit_id: u for u in units}
@@ -844,6 +859,10 @@ def process(pdf_bytes: bytes, finders: Sequence[Finder],
                 grown = occurrence_bbox(h.unit, h.start, h.end, before[pno],
                                         extra=max(0.0, r.width_delta) + 1.0)
                 if grown:
+                    if chosen_anchors.get(r.ident) == "right":
+                        grown[0] -= max(0.0, r.width_delta) + 1.0
+                    elif chosen_anchors.get(r.ident) == "center":
+                        grown[0] -= max(0.0, r.width_delta) / 2 + 1.0
                     box.append(grown)
             bbox = boxes.get(r.ident)
             if bbox:
@@ -873,6 +892,16 @@ def process(pdf_bytes: bytes, finders: Sequence[Finder],
             tofu = new_notdef(pdf_bytes, out_bytes)
         except Exception:
             tofu = []
+
+    if verify and page_boxes:
+        try:
+            clipped = new_outside_page(pdf_bytes, out_bytes)
+            if clipped:
+                verification = verification or {}
+                verification.update(acceptable=False, severity="drift", outside_page_glyphs=clipped)
+        except Exception as exc:
+            verification = verification or {}
+            verification.update(acceptable=False, error="Page-boundary verification failed: %s" % exc)
 
     results = [_result_dict(r, page_of_unit.get(r.unit_id, 0)) for r in all_results]
 

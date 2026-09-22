@@ -296,3 +296,32 @@ timestamps usage. You are responsible for what you produce.
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+
+## Engine fixes — 2026-09-08
+
+Positioned glyphs now join only when adjacent on the same baseline, with traceable
+character offsets preserved. Separate lines and columns remain distinct. This
+supports producers that emit a separate text matrix for every letter.
+
+Multiline replacement values are written on existing source baselines, rather
+than encoding newlines as glyphs. If a replacement has more lines than available
+source groups, trailing lines share the final baseline, separated by a comma.
+This preserves all supplied address text without inserting a new line into a
+neighbouring field. General paragraph reflow is not supported.
+
+Simple TrueType repair initializes the format-2 post table when converting from
+format 3 and updates symbolic (3,0) cmap entries at the font's existing code offset.
+The injected glyph must be reachable by the renderer, not merely by ToUnicode.
+
+Automatic fitting accounts for following text in other content runs. Isolated
+right-aligned labels near the page edge expand to the left at their natural size;
+the verification mask includes that expected shift. Other overflowing automatic
+fits condense within their region instead of accepting off-page text. Verification
+also compares visible glyph traces against page bounds, independently of pixel
+masks, and rejects newly clipped glyphs (including explicitly forced overflow).
+
+Validation: 21 tests, including the existing API suite, synthetic positioned-glyph,
+multiline, margin and forced-overflow regressions, and optional private fixtures.
+Private invoice fixtures are kept outside Git under data/repair-20260908; enable
+with PDF_REGRESSION_FIXTURES. Never add these PDFs to the public repository.

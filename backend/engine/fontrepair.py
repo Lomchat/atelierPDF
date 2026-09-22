@@ -509,10 +509,9 @@ def _inject_glyphs(pdf, sub, src, fi: FontInfo, missing: List[str],
                 try:
                     sub["post"].formatType = 2.0
                     sub["post"].glyphOrder = order
-                    if hasattr(sub["post"], "extraNames"):
-                        sub["post"].extraNames = []
-                    if hasattr(sub["post"], "mapping"):
-                        sub["post"].mapping = {}
+                    # Format 3 -> 2 needs these attributes even when absent.
+                    sub["post"].extraNames = []
+                    sub["post"].mapping = {}
                 except Exception:
                     pass
             _add_cmap_entries(sub, order, base_count)
@@ -605,6 +604,22 @@ def _inject_glyphs(pdf, sub, src, fi: FontInfo, missing: List[str],
         if not ok:
             return RepairResult(ok=False, source_path=entry.path, exact_source=exact,
                                 reason=err)
+
+    # Symbolic simple TrueType fonts resolve through the (3, 0) cmap,
+    # typically at F000 + the PDF byte. /Differences and post names alone
+    # cannot make an injected outline reachable in these fonts.
+    if fi.code_len == 1 and "cmap" in sub:
+        symbolic_tables = [t for t in sub["cmap"].tables
+                           if (t.platformID, t.platEncID) == (3, 0)]
+        if symbolic_tables:
+            for table in symbolic_tables:
+                offset = 0xF000 if any(0xF000 <= c <= 0xF0FF for c in table.cmap) else 0
+                for ch, code in new_codes.items():
+                    table.cmap[offset + code] = order[new_gids[ch]]
+            buf = io.BytesIO()
+            sub.save(buf)
+            ff.write(buf.getvalue())
+            ff["/Length1"] = len(buf.getvalue())
 
     # --- /ToUnicode --------------------------------------------------------
     for ch, code in new_codes.items():
