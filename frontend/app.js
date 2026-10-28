@@ -258,7 +258,9 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     let msg = r.statusText;
     try { const j = await r.json(); msg = j.detail || msg; } catch (_) {}
-    throw new Error(msg);
+    const e = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    e.status = r.status;
+    throw e;
   }
   return r.json();
 }
@@ -271,7 +273,8 @@ const jsonPost = (path, body) => api(path, {
 
 const fmtBytes = n => n < 1024 ? n + ' B'
   : n < 1048576 ? (n / 1024).toFixed(0) + ' kB'
-  : (n / 1048576).toFixed(1) + ' MB';
+  : n < 1073741824 ? (n / 1048576).toFixed(1) + ' MB'
+  : (n / 1073741824).toFixed(2) + ' GB';
 
 const plural = (n, s = 's') => n > 1 ? s : '';
 
@@ -367,23 +370,208 @@ function resetSession() {
 
 const isPdf = f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
 
-async function upload(files) {
-  const pdfs = files.filter(isPdf);
-  if (!pdfs.length) return toast('No PDF in what you dropped.', true);
-  if (pdfs.length < files.length)
-    toast(`${files.length - pdfs.length} file(s) ignored: not PDFs.`);
+/* ---------------------------------------------------------- chunked send */
 
-  $('#landingStatus').hidden = false;
-  $('#landingStatusText').textContent = pdfs.length > 1
-    ? `Analyzing ${pdfs.length} documents…`
-    : `Analyzing “${pdfs[0].name}”…`;
+/* Files travel in slices, never as one request body: the public proxy
+   (Cloudflare Free) answers 413 to any body over 100 MB, and the owner's line
+   drops packets — a failed slice is sent again on its own, the file is never
+   restarted from zero. The server writes each slice at its offset and accepts
+   the same slice twice, so every retry is safe. */
+const CHUNK_BYTES = 32 * 1024 * 1024;   // < 100 MB, the Cloudflare Free limit
+const CHUNK_PARALLEL = 3;               // slices in flight at once
+const CHUNK_TRIES = 6;                  // per slice, waits 1 2 4 8 16 s between
+const CHUNK_STALL_MS = 90 * 1000;       // no byte acknowledged for this long: retry
 
-  const fd = new FormData();
-  pdfs.forEach(f => fd.append('files', f));
-  fd.append('locale', 'fr');   // date convention fallback, see buildBody()
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+/* Worth another try: network failure, timeout, overload or proxy error. Not a
+   4xx that states a fact about the request (too big, not a PDF, disk full). */
+const transient = e => !e.status || e.status === 408 || e.status === 429
+  || (e.status >= 500 && e.status !== 501 && e.status !== 507);
+
+async function withRetry(fn, onRetry) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt >= CHUNK_TRIES || !transient(e)) throw e;
+      const wait = Math.min(30, 2 ** (attempt - 1)) * 1000 * (0.75 + Math.random() / 2);
+      if (onRetry) onRetry(e, attempt);
+      await sleep(wait);
+    }
+  }
+}
+
+/* One slice, by XHR rather than fetch: XHR reports upload progress, which a
+   32 MiB slice on a slow line badly needs. */
+function putChunk(uid, index, offset, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    let watchdog;
+    const arm = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => x.abort(), CHUNK_STALL_MS);
+    };
+    const fail = (msg, status) => {
+      clearTimeout(watchdog);
+      onProgress(0);
+      const e = new Error(msg);
+      e.status = status;
+      reject(e);
+    };
+    x.open('PUT', `/api/uploads/${uid}/chunks/${index}?offset=${offset}`);
+    x.setRequestHeader('X-Atelier-Source', 'plateforme');
+    x.setRequestHeader('Content-Type', 'application/octet-stream');
+    x.upload.onprogress = ev => { arm(); onProgress(ev.loaded); };
+    x.onload = () => {
+      clearTimeout(watchdog);
+      if (x.status >= 200 && x.status < 300) {
+        onProgress(blob.size);
+        try { resolve(JSON.parse(x.responseText)); } catch (_) { resolve({}); }
+        return;
+      }
+      let msg = x.statusText || `HTTP ${x.status}`;
+      try { msg = JSON.parse(x.responseText).detail || msg; } catch (_) {}
+      fail(msg, x.status);
+    };
+    x.onerror = () => fail('connection lost', 0);
+    x.onabort = () => fail('connection stalled', 0);
+    arm();
+    x.send(blob);
+  });
+}
+
+/* Sends files and returns their upload ids, in order. Every upload is opened
+   first: the server reserves the disk space then, so "server full" or "file
+   too large" comes back at once rather than after a gigabyte. */
+async function sendFiles(files, sid, report) {
+  const ups = [];
   try {
-    const data = await api('/api/lots', { method: 'POST', body: fd });
+    for (const f of files) {
+      const st = await withRetry(() => jsonPost('/api/uploads', {
+        filename: f.name, size: f.size, chunk_size: CHUNK_BYTES, lot: sid || null,
+      }));
+      ups.push({ file: f, id: st.id, chunk: st.chunk_size, n: st.chunks });
+    }
+
+    const total = files.reduce((a, f) => a + f.size, 0);
+    const loaded = new Map();               // in-flight slice -> bytes sent
+    let done = 0, note = '';
+    const tick = () => {
+      let sent = done;
+      for (const v of loaded.values()) sent += v;
+      report(sent, total, note);
+    };
+
+    const queue = [];
+    for (const u of ups)
+      for (let i = 0; i < u.n; i++) queue.push({ u, i });
+    let failed = null;
+
+    const worker = async () => {
+      while (queue.length && !failed) {
+        const { u, i } = queue.shift();
+        const key = `${u.id}:${i}`;
+        const offset = i * u.chunk;
+        const blob = u.file.slice(offset, Math.min(offset + u.chunk, u.file.size));
+        try {
+          await withRetry(
+            () => putChunk(u.id, i, offset, blob, b => { loaded.set(key, b); tick(); }),
+            (e, attempt) => {
+              note = `${e.message}, retrying (${attempt}/${CHUNK_TRIES - 1})…`;
+              tick();
+            });
+          loaded.delete(key);
+          done += blob.size;
+          note = '';
+          tick();
+        } catch (e) {
+          failed = failed || e;
+        }
+      }
+    };
+    tick();
+    await Promise.all(Array.from({ length: CHUNK_PARALLEL }, worker));
+    if (failed) throw failed;
+    return ups.map(u => u.id);
+  } catch (e) {
+    for (const u of ups)
+      api(`/api/uploads/${u.id}`, { method: 'DELETE' }).catch(() => {});
+    throw e;
+  }
+}
+
+const progressText = (verb, sent, total, note) =>
+  `${verb} ${total ? Math.floor(100 * sent / total) : 100} % · ${fmtBytes(sent)} / ${fmtBytes(total)}`
+  + (note ? ` — ${note}` : '');
+
+/* Each finished file joins the batch through its own request: analysing a
+   whole batch in one request could outlast the proxy's response timeout. */
+async function finishUploads(ids, pdfs, sid, status) {
+  let data = null;
+  const errors = [];
+  for (let k = 0; k < ids.length; k++) {
+    status(pdfs.length > 1
+      ? `Analyzing “${pdfs[k].name}” (${k + 1}/${pdfs.length})…`
+      : `Analyzing “${pdfs[k].name}”…`);
+    const body = { uploads: [ids[k]], locale: 'fr' };   // date convention fallback, see buildBody()
+    try {
+      data = await withRetry(() => sid
+        ? jsonPost(`/api/lots/${sid}/documents/from-uploads`, body)
+        : jsonPost('/api/lots/from-uploads', body));
+      sid = data.id;
+    } catch (e) {
+      errors.push(`${pdfs[k].name}: ${e.message}`);
+      api(`/api/uploads/${ids[k]}`, { method: 'DELETE' }).catch(() => {});
+    }
+  }
+  return { data, errors };
+}
+
+/* The checks the server will make anyway, made before the first byte. */
+function preflight(pdfs, already = 0, docs = 0) {
+  const big = pdfs.find(f => f.size > LIMITS.file);
+  if (big) return `“${big.name}” is over ${fmtBytes(LIMITS.file)}.`;
+  if (docs + pdfs.length > LIMITS.docs) return `Maximum ${LIMITS.docs} documents per batch.`;
+  const sum = pdfs.reduce((a, f) => a + f.size, already);
+  if (sum > LIMITS.lot) return `The batch is over ${fmtBytes(LIMITS.lot)} in total.`;
+  return null;
+}
+
+const LIMITS = { file: 1024 ** 3, lot: 4 * 1024 ** 3, docs: 24 };
+api('/api/limits').then(l => {
+  LIMITS.file = l.max_file_bytes; LIMITS.lot = l.max_lot_bytes; LIMITS.docs = l.max_docs;
+}).catch(() => {});
+
+let uploading = false;
+
+function usablePdfs(files) {
+  const pdfs = files.filter(isPdf);
+  const empty = pdfs.filter(f => !f.size);
+  if (empty.length) toast(`${empty.length} empty file(s) ignored.`);
+  return pdfs.filter(f => f.size);
+}
+
+async function upload(files) {
+  if (uploading) return toast('An upload is already in progress.');
+  const notPdf = files.length - files.filter(isPdf).length;
+  const pdfs = usablePdfs(files);
+  if (!pdfs.length) return toast('No PDF in what you dropped.', true);
+  if (notPdf) toast(`${notPdf} file(s) ignored: not PDFs.`);
+  const refused = preflight(pdfs);
+  if (refused) return toast(refused, true);
+
+  const status = t => { $('#landingStatusText').textContent = t; };
+  $('#landingStatus').hidden = false;
+  uploading = true;
+  try {
+    const ids = await sendFiles(pdfs, null, (sent, total, note) =>
+      status(progressText(pdfs.length > 1 ? `Uploading ${pdfs.length} documents…` : 'Uploading…',
+                          sent, total, note)));
+    const { data, errors } = await finishUploads(ids, pdfs, null, status);
+    if (errors.length) toast(errors.join(' · '), true);
+    if (!data) return;
+
     resetSession();
     S.sid = data.id;
     S.docs = data.docs.map(newDoc);
@@ -397,6 +585,7 @@ async function upload(files) {
   } catch (e) {
     toast(e.message, true);
   } finally {
+    uploading = false;
     $('#landingStatus').hidden = true;
   }
 }
@@ -404,22 +593,29 @@ async function upload(files) {
 /* Adding documents to an already open batch: they inherit the current rules,
    so the search is re-run right after. */
 async function addFiles(files) {
-  const pdfs = [...files].filter(isPdf);
+  const pdfs = usablePdfs([...files]);
   if (!pdfs.length || !S.sid) return;
-  const fd = new FormData();
-  pdfs.forEach(f => fd.append('files', f));
-  fd.append('locale', 'fr');   // date convention fallback, see buildBody()
+  if (uploading) return toast('An upload is already in progress.');
+  const refused = preflight(pdfs, S.docs.reduce((a, d) => a + (d.size || 0), 0), S.docs.length);
+  if (refused) return toast(refused, true);
+  const status = t => { $('#busyText').textContent = t; };
+  uploading = true;
   try {
-    pushBusy('analyzing…');
-    const data = await api(`/api/lots/${S.sid}/documents`, { method: 'POST', body: fd });
+    pushBusy('uploading…');
+    const ids = await sendFiles(pdfs, S.sid, (sent, total, note) =>
+      status(progressText('uploading', sent, total, note)));
+    const { data, errors } = await finishUploads(ids, pdfs, S.sid, status);
+    if (errors.length) toast(errors.join(' · '), true);
+    if (!data) return;
     const known = new Set(S.docs.map(d => d.id));
-    for (const x of data.docs) if (!known.has(x.id)) S.docs.push(newDoc(x));
+    const fresh = data.docs.filter(x => !known.has(x.id));
+    for (const x of fresh) S.docs.push(newDoc(x));
     renderRail(); setDocMeta();
-    toast(`${pdfs.length} document${plural(pdfs.length)} added.`);
+    if (!errors.length) toast(`${fresh.length} document${plural(fresh.length)} added.`);
     runScan();
   } catch (e) {
     toast(e.message, true);
-  } finally { popBusy(); }
+  } finally { uploading = false; popBusy(); }
 }
 
 async function removeDoc(did) {

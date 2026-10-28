@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import os
+import queue
 import re
 import shutil
 import sys
+import threading
 import time
 import uuid
 import zipfile
@@ -36,7 +37,7 @@ from public_api import install_public_api
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
-                               Response)
+                               Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -52,10 +53,34 @@ LOTS_DIR = os.path.join(DATA_DIR, "sessions")
 FONTS_DIR = os.path.join(DATA_DIR, "fonts")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 LOG_PATH = os.path.join(DATA_DIR, "usage.log")
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 
+# Limits of the one-shot public API (/api/replace): its body is a single
+# multipart request, so it stays bounded by what the proxies let through.
 MAX_FILE_BYTES = 40 * 1024 * 1024
 MAX_LOT_BYTES = 160 * 1024 * 1024
 MAX_DOCS = 24
+
+# Limits of the interactive batches, whose files arrive in chunks (see
+# "Chunked uploads" below). The engine holds a whole document in memory — the
+# bytes, MuPDF, pikepdf, the rewritten copy and the verification renders: a
+# 270 MB PDF peaks at ~1.2 GB of RSS, so about 4.5x its size. Up to
+# MAX_PARALLEL documents of a batch are processed at once, in each of the two
+# workers: 1 GiB per file keeps the worst case of one batch near 18 GB.
+LOT_MAX_FILE_BYTES = 1024 * 1024 * 1024
+LOT_MAX_BYTES = 4 * 1024 * 1024 * 1024
+
+# Chunked uploads. A chunk must stay < 100 MB: the Cloudflare Free proxy
+# rejects any request body above that (413). The browser sends 32 MiB; this
+# is the largest chunk the server accepts.
+UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024
+UPLOAD_MIN_CHUNK_BYTES = 64 * 1024
+# An upload nobody has touched for this long is abandoned and deleted.
+UPLOAD_TTL = 3600
+MAX_PENDING_UPLOADS = 256
+# Space that must remain free on the data disk once an upload is reserved, on
+# top of room for the rewritten copy of the file (as large as the original).
+DISK_RESERVE_BYTES = 1024 * 1024 * 1024
 MAX_PAGES = 800
 SESSION_TTL = 3 * 3600
 CLEANUP_INTERVAL = 600
@@ -64,7 +89,7 @@ CLEANUP_INTERVAL = 600
 # its time in pikepdf and MuPDF, which release the GIL: threads are enough.
 MAX_PARALLEL = 4
 
-for d in (DATA_DIR, LOTS_DIR, FONTS_DIR):
+for d in (DATA_DIR, LOTS_DIR, FONTS_DIR, UPLOADS_DIR):
     os.makedirs(d, exist_ok=True)
 
 app = FastAPI(title="Atelier PDF", version="1.1.0",
@@ -153,10 +178,16 @@ class Lot:
                 return d
         raise HTTPException(404, "Unknown document in this batch.")
 
-    def read(self, did: str, version: str) -> bytes:
+    def path(self, did: str, version: str) -> str:
         d = self.doc(did)
-        path = self.edited(did) if (version == "after" and d.has_output) \
+        return self.edited(did) if (version == "after" and d.has_output) \
             else self.original(did)
+
+    def read(self, did: str, version: str) -> bytes:
+        return self.read_path(self.path(did, version))
+
+    @staticmethod
+    def read_path(path: str) -> bytes:
         with open(path, "rb") as fh:
             return fh.read()
 
@@ -293,9 +324,21 @@ async def _cleanup_loop() -> None:
                             LOTS.pop(name, None)
                     except OSError:
                         pass
+            _purge_uploads(now)
         except Exception:
             pass
         await asyncio.sleep(CLEANUP_INTERVAL)
+
+
+def _purge_uploads(now: float) -> None:
+    """Deletes the uploads left idle for UPLOAD_TTL: abandoned, or finished."""
+    for name in os.listdir(UPLOADS_DIR):
+        p = os.path.join(UPLOADS_DIR, name)
+        try:
+            if os.path.isdir(p) and now - os.path.getmtime(p) > UPLOAD_TTL:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def _drop(sid: str, lot: Optional[Lot] = None) -> None:
@@ -412,47 +455,80 @@ async def health() -> dict:
     return {"ok": True, "lots": len(LOTS), "fonts_indexed": len(_font_library.entries)}
 
 
-async def _ingest(lot: Lot, files: List[UploadFile], locale: str) -> List[Doc]:
-    """Stores new files and analyses them structurally."""
-    added: List[Doc] = []
+def _check_room(lot: Lot, name: str, size: int) -> None:
+    """Batch limits, checked before a file is accepted into `lot`."""
+    if len(lot.docs) >= MAX_DOCS:
+        raise HTTPException(413, "Maximum %d documents per batch." % MAX_DOCS)
+    if size > LOT_MAX_FILE_BYTES:
+        raise HTTPException(413, '"%s" is over %s.' % (name, _fmt_bytes(LOT_MAX_FILE_BYTES)))
+    if lot.total_bytes + size > LOT_MAX_BYTES:
+        raise HTTPException(413, "The batch is over %s in total." % _fmt_bytes(LOT_MAX_BYTES))
 
-    for up in files:
-        if len(lot.docs) >= MAX_DOCS:
-            raise HTTPException(413, "Maximum %d documents per batch." % MAX_DOCS)
-        raw = await up.read(MAX_FILE_BYTES + 1)
-        name = _safe_name(up.filename)
-        if not raw:
-            continue
-        if len(raw) > MAX_FILE_BYTES:
-            raise HTTPException(413, '"%s" is over %d MB.'
-                                % (name, MAX_FILE_BYTES // (1024 * 1024)))
-        if lot.total_bytes + len(raw) > MAX_LOT_BYTES:
-            raise HTTPException(413, "The batch is over %d MB in total."
-                                % (MAX_LOT_BYTES // (1024 * 1024)))
-        if raw[:5] != b"%PDF-":
+
+def _fmt_bytes(n: float) -> str:
+    return ("%.1f GB" % (n / 1024 ** 3)) if n >= 1024 ** 3 else ("%d MB" % (n // 1024 ** 2))
+
+
+async def _ingest_path(lot: Lot, name: str, path: str, size: int, locale: str) -> Doc:
+    """
+    Moves a file already on disk into the batch and analyses it. `path` must
+    sit on the data disk: the move is a rename, never a copy of gigabytes.
+    """
+    _check_room(lot, name, size)
+    with open(path, "rb") as fh:
+        if fh.read(5) != b"%PDF-":
             raise HTTPException(400, '"%s" is not a PDF.' % name)
 
-        did = "d%d" % lot.seq
-        lot.seq += 1
-        os.makedirs(lot.doc_dir(did), exist_ok=True)
-        with open(lot.original(did), "wb") as fh:
-            fh.write(raw)
+    did = "d%d" % lot.seq
+    lot.seq += 1
+    os.makedirs(lot.doc_dir(did), exist_ok=True)
+    os.replace(path, lot.original(did))
 
-        doc = Doc(did=did, filename=name, size=len(raw))
-        try:
-            analysis = await _run(analyze, raw, [], None, locale,
-                                  cache_key=lot.cache_key(did))
-            if analysis.pages > MAX_PAGES:
-                raise ValueError("document too long (%d pages, maximum %d)"
-                                 % (analysis.pages, MAX_PAGES))
-            doc.analysis = analysis.to_dict()
-            doc.pages = analysis.pages
-        except Exception as e:
-            doc.error = str(e)
-        lot.docs.append(doc)
-        added.append(doc)
+    doc = Doc(did=did, filename=name, size=size)
+    try:
+        raw = await asyncio.get_event_loop().run_in_executor(
+            None, lot.read_path, lot.original(did))
+        analysis = await _run(analyze, raw, [], None, locale,
+                              cache_key=lot.cache_key(did))
+        del raw
+        if analysis.pages > MAX_PAGES:
+            raise ValueError("document too long (%d pages, maximum %d)"
+                             % (analysis.pages, MAX_PAGES))
+        doc.analysis = analysis.to_dict()
+        doc.pages = analysis.pages
+    except Exception as e:
+        doc.error = str(e)
+    lot.docs.append(doc)
+    return doc
 
-    lot.save()
+
+async def _ingest(lot: Lot, files: List[UploadFile], locale: str) -> List[Doc]:
+    """Stores new multipart files and analyses them structurally."""
+    added: List[Doc] = []
+    try:
+        for up in files:
+            name = _safe_name(up.filename)
+            if len(lot.docs) >= MAX_DOCS:
+                raise HTTPException(413, "Maximum %d documents per batch." % MAX_DOCS)
+            # Streamed to disk, never held whole in memory.
+            tmp = os.path.join(lot.dir, "incoming-%s.tmp" % uuid.uuid4().hex[:8])
+            size = 0
+            try:
+                with open(tmp, "wb") as fh:
+                    while True:
+                        piece = await up.read(1024 * 1024)
+                        if not piece:
+                            break
+                        size += len(piece)
+                        _check_room(lot, name, size)
+                        fh.write(piece)
+                if size:
+                    added.append(await _ingest_path(lot, name, tmp, size, locale))
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+    finally:
+        lot.save()
     return added
 
 
@@ -488,6 +564,305 @@ async def add_documents(request: Request, sid: str,
     _log(request, "add", sid=sid, names=[_safe_name(f.filename) for f in files])
     added = await _ingest(lot, files, locale)
     _log(request, "add", sid=sid, docs=len(added), files=[{"filename": d.filename, "size": d.size, "pages": d.pages, "error": d.error} for d in added])
+    return JSONResponse({"id": sid, "added": [d.did for d in added],
+                         "docs": [d.to_dict() for d in lot.docs]})
+
+
+# --------------------------------------------------------------------------
+# Chunked uploads
+# --------------------------------------------------------------------------
+#
+# The public proxy (Cloudflare Free) refuses any request body over 100 MB, and
+# a flaky line must not restart a gigabyte from zero. A file therefore travels
+# as numbered chunks:
+#
+#   POST   /api/uploads                     {filename, size, chunk_size, lot?}
+#   PUT    /api/uploads/{uid}/chunks/{i}?offset=   raw bytes of chunk i
+#   GET    /api/uploads/{uid}               which chunks arrived (resume)
+#   DELETE /api/uploads/{uid}               abandon
+#   POST   /api/lots/from-uploads           {uploads: [uid], locale}
+#   POST   /api/lots/{sid}/documents/from-uploads
+#
+# The full size is reserved on disk up front (fallocate): a disk too full is
+# refused before the first byte, and two concurrent uploads cannot both count
+# on the same free space. Each chunk is written at its offset, straight to the
+# file, then a marker file records it — one file per chunk, so the two uvicorn
+# workers never race on a shared state file. Sending a chunk again rewrites the
+# same bytes at the same place: idempotent. Finishing is a rename into the
+# batch, never a copy, and leaves a tombstone so a retried finish (response
+# lost on the way) returns the same result instead of failing.
+
+_UID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+class UploadIn(BaseModel):
+    filename: str = Field("document.pdf", max_length=1024)
+    size: int
+    chunk_size: int = UPLOAD_CHUNK_BYTES
+    lot: Optional[str] = None
+
+
+class FromUploads(BaseModel):
+    uploads: List[str] = Field(..., min_length=1, max_length=MAX_DOCS)
+    locale: str = "fr"
+
+
+def _upload_dir(uid: str) -> str:
+    if not _UID_RE.match(uid or ""):
+        raise HTTPException(400, "Invalid upload id.")
+    return os.path.join(UPLOADS_DIR, uid)
+
+
+def _upload_meta(uid: str) -> dict:
+    try:
+        with open(os.path.join(_upload_dir(uid), "meta.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        raise HTTPException(404, "Unknown or expired upload. Send the file again.")
+
+
+def _upload_done(uid: str) -> Optional[dict]:
+    try:
+        with open(os.path.join(_upload_dir(uid), "done.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _received(uid: str) -> List[int]:
+    try:
+        return sorted(int(n) for n in os.listdir(os.path.join(_upload_dir(uid), "chunks")))
+    except OSError:
+        return []
+
+
+def _upload_state(meta: dict) -> dict:
+    got = _received(meta["id"])
+    return {"id": meta["id"], "filename": meta["filename"], "size": meta["size"],
+            "chunk_size": meta["chunk_size"], "chunks": meta["chunks"],
+            "received": got, "complete": len(got) == meta["chunks"],
+            "done": _upload_done(meta["id"])}
+
+
+@app.get("/api/limits")
+async def limits() -> dict:
+    return {"max_file_bytes": LOT_MAX_FILE_BYTES, "max_lot_bytes": LOT_MAX_BYTES,
+            "max_docs": MAX_DOCS, "chunk_bytes": UPLOAD_CHUNK_BYTES,
+            "free_bytes": max(0, shutil.disk_usage(UPLOADS_DIR).free - DISK_RESERVE_BYTES)}
+
+
+@app.post("/api/uploads")
+async def start_upload(request: Request, body: UploadIn) -> dict:
+    name = _safe_name(body.filename)
+    _log(request, "upload_start", names=[name], bytes=body.size, sid=body.lot)
+    if body.size <= 0:
+        raise HTTPException(400, '"%s" is empty.' % name)
+    # A small file may come as one chunk of exactly its size.
+    if not min(UPLOAD_MIN_CHUNK_BYTES, body.size) <= body.chunk_size <= UPLOAD_CHUNK_BYTES:
+        raise HTTPException(400, "chunk_size must be between %d and %d bytes."
+                            % (UPLOAD_MIN_CHUNK_BYTES, UPLOAD_CHUNK_BYTES))
+    if body.lot:
+        _check_room(get_lot(body.lot), name, body.size)
+    elif body.size > LOT_MAX_FILE_BYTES:
+        raise HTTPException(413, '"%s" is over %s.' % (name, _fmt_bytes(LOT_MAX_FILE_BYTES)))
+    if len(os.listdir(UPLOADS_DIR)) >= MAX_PENDING_UPLOADS:
+        raise HTTPException(429, "Too many uploads in progress. Try again later.")
+
+    # The file is reserved below, and its rewritten copy will need as much.
+    need = 2 * body.size + DISK_RESERVE_BYTES
+    free = shutil.disk_usage(UPLOADS_DIR).free
+    if free < need:
+        raise HTTPException(507, "Not enough free space on the server for \"%s\" "
+                            "(%s needed, %s free)." % (name, _fmt_bytes(need), _fmt_bytes(free)))
+
+    uid = uuid.uuid4().hex
+    folder = os.path.join(UPLOADS_DIR, uid)
+    os.makedirs(os.path.join(folder, "chunks"))
+    meta = {"id": uid, "filename": name, "size": body.size,
+            "chunk_size": body.chunk_size,
+            "chunks": -(-body.size // body.chunk_size),
+            "lot": body.lot, "created": time.time()}
+    try:
+        fd = os.open(os.path.join(folder, "data.part"), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            os.posix_fallocate(fd, 0, body.size)
+        finally:
+            os.close(fd)
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+    except OSError:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(507, 'Not enough free space on the server for "%s".' % name)
+    _log(request, "upload_start", upload=uid, chunks=meta["chunks"])
+    return _upload_state(meta)
+
+
+@app.put("/api/uploads/{uid}/chunks/{index}")
+async def put_chunk(request: Request, uid: str, index: int, offset: int) -> dict:
+    meta = _upload_meta(uid)
+    folder = _upload_dir(uid)
+    # A successful chunk is not worth an audit record (a gigabyte is 32 of
+    # them); a refused one is.
+    request.state.audit.update(event="upload_chunk", upload=uid, chunk=index, _quiet=True)
+    if _upload_done(uid) is not None:
+        raise HTTPException(409, "This upload is already finished.")
+    if not 0 <= index < meta["chunks"]:
+        raise HTTPException(400, "Chunk %d out of range (0-%d)." % (index, meta["chunks"] - 1))
+    if offset != index * meta["chunk_size"]:
+        raise HTTPException(409, "Chunk %d starts at offset %d, not %d."
+                            % (index, index * meta["chunk_size"], offset))
+    expected = min(meta["chunk_size"], meta["size"] - offset)
+    declared = request.headers.get("content-length")
+    if declared is not None and declared != str(expected):
+        raise HTTPException(400, "Chunk %d must be %d bytes, not %s."
+                            % (index, expected, declared))
+
+    path = os.path.join(folder, "data.part")
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except OSError:
+        raise HTTPException(409, "This upload is being finished.")
+    loop = asyncio.get_event_loop()
+    got, head, buf = 0, b"", bytearray()
+
+    def flush(data: bytes, at: int) -> None:
+        view = memoryview(data)
+        while view:
+            n = os.pwrite(fd, view, at)
+            view, at = view[n:], at + n
+
+    try:
+        async for piece in request.stream():
+            if got + len(buf) + len(piece) > expected:
+                raise HTTPException(400, "Chunk %d is longer than %d bytes." % (index, expected))
+            if len(head) < 5:
+                head += piece[:5 - len(head)]
+            buf += piece
+            # Written as it arrives, a few MiB at a time, off the event loop.
+            if len(buf) >= 4 * 1024 * 1024:
+                await loop.run_in_executor(None, flush, bytes(buf), offset + got)
+                got += len(buf)
+                buf.clear()
+        if buf:
+            await loop.run_in_executor(None, flush, bytes(buf), offset + got)
+            got += len(buf)
+    finally:
+        os.close(fd)
+    if got != expected:
+        raise HTTPException(400, "Chunk %d is incomplete: %d of %d bytes." % (index, got, expected))
+    if index == 0 and head != b"%PDF-":
+        shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(400, '"%s" is not a PDF.' % meta["filename"])
+
+    open(os.path.join(folder, "chunks", str(index)), "w").close()
+    os.utime(folder)          # still alive: pushes back the expiry
+    got_all = _received(uid)
+    return {"id": uid, "index": index, "received": len(got_all),
+            "chunks": meta["chunks"], "complete": len(got_all) == meta["chunks"]}
+
+
+@app.get("/api/uploads/{uid}")
+async def upload_state(uid: str) -> dict:
+    return _upload_state(_upload_meta(uid))
+
+
+@app.delete("/api/uploads/{uid}")
+async def cancel_upload(request: Request, uid: str) -> dict:
+    folder = _upload_dir(uid)
+    _log(request, "upload_cancel", upload=uid)
+    shutil.rmtree(folder, ignore_errors=True)
+    return {"ok": True}
+
+
+async def _consume(lot: Lot, uids: List[str], locale: str) -> List[Doc]:
+    """Turns finished uploads into documents of `lot`. Safe to call again."""
+    added: List[Doc] = []
+    try:
+        for uid in uids:
+            folder = _upload_dir(uid)
+            done = _upload_done(uid)
+            if done is not None:
+                if done.get("lot") != lot.sid:
+                    raise HTTPException(409, "This upload already belongs to another batch.")
+                added.extend(d for d in lot.docs if d.did == done.get("doc"))
+                continue
+            meta = _upload_meta(uid)
+            if meta.get("lot") and meta["lot"] != lot.sid:
+                raise HTTPException(409, "This upload was started for another batch.")
+            missing = sorted(set(range(meta["chunks"])) - set(_received(uid)))
+            if missing:
+                raise HTTPException(409, '"%s" is incomplete: %d chunk(s) missing (first: %d).'
+                                    % (meta["filename"], len(missing), missing[0]))
+            # Two finishes of the same upload at once (two workers): one wins.
+            try:
+                os.close(os.open(os.path.join(folder, "finishing"),
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                raise HTTPException(409, "This upload is already being finished.")
+            try:
+                doc = await _ingest_path(lot, meta["filename"],
+                                         os.path.join(folder, "data.part"),
+                                         meta["size"], locale)
+            except BaseException:
+                try:
+                    os.remove(os.path.join(folder, "finishing"))
+                except OSError:
+                    pass
+                raise
+            lot.save()
+            with open(os.path.join(folder, "done.json"), "w", encoding="utf-8") as fh:
+                json.dump({"lot": lot.sid, "doc": doc.did}, fh)
+            os.utime(folder)
+            added.append(doc)
+    finally:
+        lot.save()
+    return added
+
+
+def _audit_files(docs: List[Doc]) -> List[dict]:
+    return [{"filename": d.filename, "size": d.size, "pages": d.pages, "error": d.error}
+            for d in docs]
+
+
+@app.post("/api/lots/from-uploads")
+async def create_lot_from_uploads(request: Request, body: FromUploads) -> JSONResponse:
+    _log(request, "upload", uploads=body.uploads)
+    for uid in body.uploads:
+        _upload_dir(uid)
+    # A retried request (its first answer lost) finds the batch it created.
+    lot = None
+    for uid in body.uploads:
+        done = _upload_done(uid)
+        if done is not None:
+            lot = get_lot(done.get("lot", ""))
+            break
+    created = lot is None
+    if created:
+        lot = Lot(sid=uuid.uuid4().hex[:20], created=time.time())
+        os.makedirs(lot.dir, exist_ok=True)
+    try:
+        await _consume(lot, body.uploads, body.locale)
+    except HTTPException:
+        if created and not lot.docs:
+            shutil.rmtree(lot.dir, ignore_errors=True)
+        raise
+    if not lot.docs:
+        shutil.rmtree(lot.dir, ignore_errors=True)
+        raise HTTPException(400, "No usable document.")
+    LOTS[lot.sid] = lot
+    _log(request, "upload", sid=lot.sid, docs=len(lot.docs), bytes=lot.total_bytes,
+         names=[d.filename for d in lot.docs], files=_audit_files(lot.docs))
+    return JSONResponse(lot.to_dict())
+
+
+@app.post("/api/lots/{sid}/documents/from-uploads")
+async def add_documents_from_uploads(request: Request, sid: str,
+                                     body: FromUploads) -> JSONResponse:
+    lot = get_lot(sid)
+    _log(request, "add", sid=sid, uploads=body.uploads)
+    added = await _consume(lot, body.uploads, body.locale)
+    _log(request, "add", sid=sid, docs=len(added), names=[d.filename for d in added],
+         files=_audit_files(added))
     return JSONResponse({"id": sid, "added": [d.did for d in added],
                          "docs": [d.to_dict() for d in lot.docs]})
 
@@ -627,8 +1002,9 @@ async def page_png(sid: str, did: str, page: int, v: str = "before",
                             headers={"Cache-Control": "private, max-age=600"})
 
     def render() -> bytes:
-        data = lot.read(did, version)
-        d = fitz.open(stream=data, filetype="pdf")
+        # Opened from the file: MuPDF reads only what the page needs, instead
+        # of the whole document (up to a gigabyte) for every page.
+        d = fitz.open(lot.path(did, version), filetype="pdf")
         try:
             if not 0 <= page < d.page_count:
                 raise HTTPException(404, "No such page.")
@@ -656,8 +1032,8 @@ async def diff_png(sid: str, did: str, page: int, dpi: int = 130) -> Response:
     dpi = max(60, min(300, dpi))
 
     def render() -> bytes:
-        before = fitz.open(stream=lot.read(did, "before"), filetype="pdf")
-        after = fitz.open(stream=lot.read(did, "after"), filetype="pdf")
+        before = fitz.open(lot.path(did, "before"), filetype="pdf")
+        after = fitz.open(lot.path(did, "after"), filetype="pdf")
         try:
             stored = (doc.last_outcome or {}).get("page_boxes") or {}
             boxes = stored.get(str(page)) or stored.get(page) or []
@@ -695,26 +1071,78 @@ async def download_all(request: Request, sid: str) -> Response:
         return FileResponse(lot.edited(d.did), media_type="application/pdf",
                             filename=_output_name(d.filename))
 
-    def build() -> bytes:
-        buf = io.BytesIO()
-        used: Dict[str, int] = {}
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-            for d in modified:
-                name = _output_name(d.filename)
-                # Two original files may bear the same name: we do not let one
-                # silently overwrite the other.
-                n = used.get(name, 0)
-                used[name] = n + 1
-                if n:
-                    base, ext = os.path.splitext(name)
-                    name = "%s (%d)%s" % (base, n + 1, ext)
-                z.write(lot.edited(d.did), arcname=name)
-        return buf.getvalue()
+    # A batch can weigh gigabytes: the archive is streamed as it is written,
+    # never assembled in memory nor on the (small) disk. zipfile supports an
+    # unseekable output by writing data descriptors after each member.
+    pipe: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    failed: List[BaseException] = []
 
-    data = await _run(build)
+    def put(item: Optional[bytes]) -> None:
+        while not stop.is_set():
+            try:
+                pipe.put(item, timeout=1)
+                return
+            except queue.Full:
+                pass
+        raise OSError("download abandoned")
+
+    class _Sink:
+        def write(self, b) -> int:
+            put(bytes(b))
+            return len(b)
+
+        def flush(self) -> None:
+            pass
+
+    def build() -> None:
+        used: Dict[str, int] = {}
+        try:
+            with zipfile.ZipFile(_Sink(), "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                for d in modified:
+                    name = _output_name(d.filename)
+                    # Two original files may bear the same name: we do not let
+                    # one silently overwrite the other.
+                    n = used.get(name, 0)
+                    used[name] = n + 1
+                    if n:
+                        base, ext = os.path.splitext(name)
+                        name = "%s (%d)%s" % (base, n + 1, ext)
+                    z.write(lot.edited(d.did), arcname=name)
+        except BaseException as e:
+            failed.append(e)
+        finally:
+            try:
+                put(None)
+            except OSError:
+                pass
+
+    def get() -> Optional[bytes]:
+        while not stop.is_set():
+            try:
+                return pipe.get(timeout=1)
+            except queue.Empty:
+                pass
+        return None
+
+    async def stream():
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, build)
+        try:
+            while True:
+                piece = await loop.run_in_executor(None, get)
+                if piece is None:
+                    break
+                yield piece
+            if failed:
+                # Cut the connection rather than end a truncated archive cleanly.
+                raise RuntimeError("archive failed: %s" % failed[0])
+        finally:
+            stop.set()
+
     _log(request, "download", sid=sid, docs=len(modified))
     stamp = time.strftime("%Y%m%d-%H%M")
-    return Response(data, media_type="application/zip", headers={
+    return StreamingResponse(stream(), media_type="application/zip", headers={
         "Content-Disposition": 'attachment; filename="atelier-pdf-%s.zip"' % stamp,
     })
 

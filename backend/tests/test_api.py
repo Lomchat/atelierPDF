@@ -233,3 +233,104 @@ def test_worker_timeout_cleanup(client, monkeypatch):
     assert replace(client).status_code == 504
     assert process.killed
     assert set(Path('/tmp').glob('atelier-api-*')) == before
+
+
+def chunked(client, raw, name='chunked.pdf', chunk=64 * 1024, lot=None, headers=None):
+    body = {'filename': name, 'size': len(raw), 'chunk_size': chunk}
+    if lot:
+        body['lot'] = lot
+    start = client.post('/api/uploads', json=body, headers=headers)
+    assert start.status_code == 200, start.text
+    state = start.json()
+    assert state['chunks'] == -(-len(raw) // chunk) and state['received'] == []
+    return state
+
+
+def put(client, uid, raw, index, chunk=64 * 1024, offset=None):
+    piece = raw[index * chunk:(index + 1) * chunk]
+    return client.put(f'/api/uploads/{uid}/chunks/{index}',
+                      params={'offset': index * chunk if offset is None else offset},
+                      content=piece, headers={'Content-Type': 'application/octet-stream'})
+
+
+def test_chunked_upload_resend_loss_and_finish(client):
+    headers = {'X-Atelier-Source': 'plateforme'}
+    raw = pdf() + b'%' + os.urandom(300 * 1024)   # padded after %%EOF: still a valid PDF
+    state = chunked(client, raw, headers=headers)
+    uid, n = state['id'], state['chunks']
+    assert n >= 5
+    # Every other chunk first: the others are "lost".
+    for i in range(0, n, 2):
+        assert put(client, uid, raw, i).status_code == 200
+    # Resent chunk: idempotent.
+    assert put(client, uid, raw, 0).status_code == 200
+    # Wrong offset, short and long bodies are refused and not counted.
+    assert put(client, uid, raw, 1, offset=5).status_code == 409
+    short = client.put(f'/api/uploads/{uid}/chunks/1', params={'offset': 64 * 1024}, content=b'x' * 10)
+    assert short.status_code == 400
+    assert put(client, uid, raw, n).status_code == 400
+    missing = client.get(f'/api/uploads/{uid}').json()
+    assert not missing['complete'] and 1 not in missing['received']
+    early = client.post('/api/lots/from-uploads', json={'uploads': [uid]}, headers=headers)
+    assert early.status_code == 409 and 'missing' in early.text
+    # The lost chunks, recovered.
+    for i in range(1, n, 2):
+        assert put(client, uid, raw, i).status_code == 200
+    assert client.get(f'/api/uploads/{uid}').json()['complete']
+    made = client.post('/api/lots/from-uploads', json={'uploads': [uid]}, headers=headers)
+    assert made.status_code == 200, made.text
+    sid = made.json()['id']
+    assert made.json()['docs'][0]['size'] == len(raw) and not made.json()['docs'][0]['error']
+    assert Path(main.LOTS_DIR, sid, 'd0', 'original.pdf').read_bytes() == raw
+    # Retried finish (first answer lost): same batch, no duplicate document.
+    again = client.post('/api/lots/from-uploads', json={'uploads': [uid]}, headers=headers)
+    assert again.status_code == 200 and again.json()['id'] == sid and len(again.json()['docs']) == 1
+    assert put(client, uid, raw, 0).status_code == 409
+
+    # Second file added to the batch, as a single chunk.
+    other = pdf('Second 2024')
+    state = chunked(client, other, name='second.pdf', chunk=len(other), lot=sid)
+    assert state['chunks'] == 1
+    assert put(client, state['id'], other, 0, chunk=len(other)).status_code == 200
+    added = client.post(f'/api/lots/{sid}/documents/from-uploads', json={'uploads': [state['id']]})
+    assert added.status_code == 200 and added.json()['added'] == ['d1']
+    rules = {'finders': [{'id': 'f1', 'query': '2024', 'replace': '2026'}]}
+    assert client.post(f'/api/lots/{sid}/apply', json=rules).status_code == 200
+    archive = client.get(f'/api/lots/{sid}/download')
+    assert archive.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as z:
+        names = sorted(z.namelist())
+        assert names == ['chunked_1.pdf', 'second_1.pdf']
+        assert '2026' in extract(z.read('second_1.pdf'))
+    records = client.get('/api/admin/operations', params={'q': uid}).json()['items']
+    events = [r['event'] for r in records]
+    # Successful chunks stay out of the log; the refused ones are in it.
+    assert 'upload_start' in events and 'upload' in events
+    assert all(r['status'] >= 400 for r in records if r['event'] == 'upload_chunk')
+    assert client.delete(f'/api/lots/{sid}').status_code == 200
+
+
+def test_chunked_upload_refusals(client, monkeypatch):
+    assert client.post('/api/uploads', json={'filename': 'a.pdf', 'size': 0}).status_code == 400
+    assert client.post('/api/uploads', json={'filename': 'a.pdf', 'size': 10,
+                                             'chunk_size': 100 * 1024 * 1024}).status_code == 400
+    too_big = client.post('/api/uploads', json={'filename': 'a.pdf', 'size': main.LOT_MAX_FILE_BYTES + 1})
+    assert too_big.status_code == 413
+    with monkeypatch.context() as patch:
+        patch.setattr(main, 'DISK_RESERVE_BYTES', 10 ** 18)
+        full = client.post('/api/uploads', json={'filename': 'a.pdf', 'size': 1000})
+        assert full.status_code == 507 and 'free space' in full.text
+    # Not a PDF: refused on the first chunk, and the upload is gone.
+    raw = b'hello world' * 100
+    state = chunked(client, raw, name='fake.pdf', chunk=len(raw))
+    assert put(client, state['id'], raw, 0, chunk=len(raw)).status_code == 400
+    assert client.get(f"/api/uploads/{state['id']}").status_code == 404
+    # Abandoned uploads expire.
+    state = chunked(client, pdf(), chunk=64 * 1024)
+    folder = Path(main.UPLOADS_DIR, state['id'])
+    os.utime(folder, (1, 1))
+    main._purge_uploads(main.time.time())
+    assert not folder.exists()
+    assert client.get('/api/uploads/not-an-id').status_code == 400
+    limits = client.get('/api/limits').json()
+    assert limits['chunk_bytes'] == 32 * 1024 * 1024 < 100 * 1000 * 1000

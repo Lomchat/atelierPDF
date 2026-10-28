@@ -162,6 +162,11 @@ sudo cp deploy/pdf.service /etc/systemd/system/
 sudo systemctl enable --now pdf
 ```
 
+The unit passes `--timeout-worker-healthcheck 120` to uvicorn. With the default
+(5 s), a worker that saves a large PDF is killed in the middle of its request:
+pikepdf holds the GIL during the save, so the worker cannot answer the health
+check.
+
 ---
 
 ## Public API and administration
@@ -194,6 +199,9 @@ Optional form fields: `locale=fr|en`, `auto_repair=true`, `verify=true`, and
 
 Limits: 24 files, 40 MiB per file, 160 MiB total, 800 pages per document,
 24 equivalences, 4000 matches per document and 240 seconds of processing.
+This endpoint takes one request body: behind a proxy that caps bodies (Cloudflare
+Free: 100 MB) the whole request must also fit under that cap. Larger batches go
+through the interactive platform, which uploads in chunks.
 Invalid files, refused replacements or failed visual verification return a JSON
 error for the whole request (400/413/422/504), with no partial download.
 The API uses a temporary process and directory, both released before returning
@@ -230,8 +238,16 @@ Run the integration tests with a separate test dependency install:
 The unit of work is a **batch**: N documents sharing the same rules.
 
 ```
-POST   /api/lots                                     multipart files[] → batch + analyses
-POST   /api/lots/{id}/documents                      add more
+POST   /api/uploads                                  {filename, size, chunk_size, lot?} → upload id
+PUT    /api/uploads/{up}/chunks/{i}?offset=          raw bytes of chunk i
+GET    /api/uploads/{up}                             chunks received so far
+DELETE /api/uploads/{up}                             abandon
+POST   /api/lots/from-uploads                        {uploads: [up], locale} → batch + analyses
+POST   /api/lots/{id}/documents/from-uploads         add finished uploads to a batch
+GET    /api/limits                                   size limits, chunk size, free space
+
+POST   /api/lots                                     multipart files[] → batch (small files)
+POST   /api/lots/{id}/documents                      multipart, add more
 DELETE /api/lots/{id}/documents/{doc}
 
 POST   /api/lots/{id}/scan                           rules → matches per document
@@ -259,6 +275,35 @@ A rule looks like this:
   "date_rule": {"type": "shift", "years": 1},
   "per_doc": {"d0": {"overrides": {}, "fits": {}, "exclude": []}}
 }
+```
+
+### Chunked uploads
+
+The browser sends every file in chunks of 32 MiB (Cloudflare Free refuses
+request bodies over 100 MB), three at a time, and retries a failed chunk up to
+five times with growing waits (1, 2, 4, 8, 16 s): a lost chunk never restarts
+the file. The server reserves the file's full size on disk when the upload
+starts, writes each chunk at its offset as it arrives, accepts the same chunk
+twice, refuses a wrong offset or length, and moves the finished file into the
+batch without copying it. Uploads left idle for an hour are deleted.
+
+Batch limits: 1 GiB per file, 4 GiB per batch, 24 documents. The engine holds a
+whole document in memory (about 4.5 times its size at peak), which sets the
+per-file limit. An upload is refused (507) when the disk would keep less than
+twice the file's size plus 1 GiB free.
+
+```bash
+# upload a PDF with curl, one 32 MiB chunk at a time
+CH=$((32*1024*1024)); SIZE=$(stat -c %s big.pdf)
+UP=$(curl -s -H 'Content-Type: application/json' \
+  -d "{\"filename\":\"big.pdf\",\"size\":$SIZE,\"chunk_size\":$CH}" \
+  https://pdf.chalco.website/api/uploads | jq -r .id)
+for i in $(seq 0 $(( (SIZE-1)/CH ))); do
+  dd if=big.pdf bs=$CH skip=$i count=1 status=none | curl -s --retry 5 -X PUT \
+    --data-binary @- "https://pdf.chalco.website/api/uploads/$UP/chunks/$i?offset=$((i*CH))"
+done
+curl -s -H 'Content-Type: application/json' -d "{\"uploads\":[\"$UP\"]}" \
+  https://pdf.chalco.website/api/lots/from-uploads
 ```
 
 Removal is a **denylist**, never an allowlist: `exclude` holds stable identities

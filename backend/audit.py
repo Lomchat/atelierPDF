@@ -173,7 +173,7 @@ def install_audit(app, store):
     @app.middleware("http")
     async def audit_request(request: Request, call_next):
         path = request.url.path
-        if not (path.startswith("/api/lots") or path == "/api/replace"):
+        if not (path.startswith(("/api/lots", "/api/uploads")) or path == "/api/replace"):
             return await call_next(request)
         started = time.monotonic()
         request.state.audit = {}
@@ -199,5 +199,7 @@ def install_audit(app, store):
                    "duration_ms": round((time.monotonic() - started) * 1000),
                    "event": getattr(request.scope.get("endpoint"), "__name__", "request"),
                    **request.state.audit}
-            # SQLite transactions serialize writes across the uvicorn workers.
-            await asyncio.to_thread(store.write, rec)
+            # Routine successes flagged quiet (upload chunks) are not recorded.
+            if not (rec.pop("_quiet", False) and status < 400):
+                # SQLite transactions serialize writes across the uvicorn workers.
+                await asyncio.to_thread(store.write, rec)
